@@ -1,0 +1,60 @@
+{
+  "checked_at": "2026-10-09T13:07:00.060620+00:00",
+  "scope": "Project regional resources in sa-east-1 plus global S3, CloudFront and IAM",
+  "checks": {
+    "live_project_instances": {
+      "remaining": []
+    },
+    "volumes_in_project_region": {
+      "remaining": []
+    },
+    "snapshots_in_project_region": {
+      "remaining": []
+    },
+    "elastic_ips_in_project_region": {
+      "remaining": []
+    },
+    "active_nat_gateways_in_project_region": {
+      "remaining": []
+    },
+    "project_security_groups": {
+      "remaining": []
+    },
+    "project_network_interfaces": {
+      "remaining": []
+    },
+    "project_lambda_functions": {
+      "remaining": []
+    },
+    "project_log_groups": {
+      "remaining": []
+    },
+    "project_scheduled_rules": {
+      "remaining": []
+    },
+    "project_s3_buckets": {
+      "remaining": []
+    },
+    "project_http_api": {
+      "remaining": []
+    },
+    "project_cognito_pool": {
+      "remaining": []
+    },
+    "project_iam_roles": {
+      "remaining": []
+    },
+    "project_instance_profiles": {
+      "remaining": []
+    },
+    "project_cloudfront_distribution": {
+      "remaining": []
+    },
+    "project_cloudfront_origin_access_control": {
+      "remaining": []
+    },
+    "project_cloudfront_response_headers_policy": {
+      "remaining": []
+    }
+  }
+}

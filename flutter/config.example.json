@@ -1,0 +1,5 @@
+{
+  "API_BASE_URL": "https://YOUR_API_ID.execute-api.sa-east-1.amazonaws.com",
+  "COGNITO_ISSUER": "https://cognito-idp.sa-east-1.amazonaws.com/sa-east-1_YOUR_POOL",
+  "COGNITO_CLIENT_ID": "YOUR_APP_CLIENT"
+}

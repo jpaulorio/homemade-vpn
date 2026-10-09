@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'On-demand São Paulo Tailscale exit node with private Cognito-protected power API'
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC with Internet Gateway
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet in VPC (0.0.0.0/0 -> Internet Gateway)
+  DomainPrefix:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{2,61}[a-z0-9]$'
+    Description: Globally unique Cognito prefix (for example, brazil-exit-myfamily-random)
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3a.micro, t3a.small]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+Resources:
+  ExitNodeSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'No inbound ports; allow outbound for Tailscale, SSM and web'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Outbound IPv4
+      Tags:
+        - Key: Project
+          Value: brazil-tailscale-exit
+  ExitNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  ExitNodeProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ExitNodeRole]
+  ExitNode:
+    Type: AWS::EC2::Instance
+    Properties:
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref ExitNodeProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnetId
+          GroupSet: [!Ref ExitNodeSg]
+          AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: brazil-tailscale-exit
+        - Key: Project
+          Value: brazil-tailscale-exit
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+          cat >/etc/sysctl.d/99-tailscale-exit.conf <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+          EOF
+          sysctl --system
+          curl -fsSL https://tailscale.com/install.sh | sh
+          systemctl enable --now tailscaled
+          # Authenticate interactively via AWS Systems Manager Session Manager.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: brazil-exit-family-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UserPoolTier: LITE
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: brazil-exit-flutter
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: ['brazilexit://oauth']
+      LogoutURLs: ['brazilexit://oauth']
+      RefreshTokenValidity: 30
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref DomainPrefix
+      ManagedLoginVersion: 1
+  ControlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ControlOnlyOneInstance
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ec2:DescribeInstances]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ec2:StartInstances, ec2:StopInstances]
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${ExitNode}'
+  ControlLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ControlLambdaRole.Arn
+      Timeout: 20
+      MemorySize: 128
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref ExitNode
+      Code:
+        ZipFile: |
+          import base64
+          import os
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          ec2 = boto3.client('ec2')
+          INSTANCE_ID = os.environ['INSTANCE_ID']
+
+          def reply(code, value):
+              return {'statusCode': code,
+                      'headers': {'content-type': 'application/json', 'cache-control': 'no-store'},
+                      'body': json.dumps(value)}
+
+          def state():
+              data = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+              return data['Reservations'][0]['Instances'][0]['State']['Name']
+
+          def handler(event, context):
+              method = event.get('requestContext', {}).get('http', {}).get('method')
+              path = event.get('rawPath', '')
+              try:
+                  if method == 'GET' and path == '/state':
+                      return reply(200, {'state': state(), 'exitNodeReady': None})
+                  if method == 'POST' and path == '/power':
+                      try:
+                          body = event.get('body') or '{}'
+                          if event.get('isBase64Encoded'):
+                              body = base64.b64decode(body, validate=True).decode('utf-8')
+                          req = json.loads(body)
+                      except (ValueError, TypeError):
+                          return reply(400, {'error': 'invalid JSON'})
+                      if not isinstance(req, dict):
+                          return reply(400, {'error': 'JSON body must be an object'})
+                      action = req.get('action')
+                      if action not in ('on', 'off'):
+                          return reply(400, {'error': 'action must be on or off'})
+                      current = state()
+                      if action == 'on':
+                          if current == 'stopped':
+                              ec2.start_instances(InstanceIds=[INSTANCE_ID])
+                              return reply(202, {'state': 'pending', 'action': action})
+                          if current in ('running', 'pending'):
+                              return reply(200, {'state': current, 'action': action})
+                      else:
+                          if current == 'running':
+                              ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+                              return reply(202, {'state': 'stopping', 'action': action})
+                          if current in ('stopping', 'stopped'):
+                              return reply(200, {'state': current, 'action': action})
+                      return reply(409, {'error': 'EC2 transitional state', 'state': current})
+                  return reply(404, {'error': 'not found'})
+              except ClientError as exc:
+                  print('EC2 API failed:', exc.response.get('Error', {}).get('Code', 'unknown'))
+                  return reply(502, {'error': 'EC2 API request failed'})
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: brazil-exit-control
+      ProtocolType: HTTP
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: cognito-access-token
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+        Audience: [!Ref UserPoolClient]
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ControlLambda.Arn
+      PayloadFormatVersion: '2.0'
+  RouteState:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /state
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [openid]
+  RoutePower:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /power
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [openid]
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ControlLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*'
+Outputs:
+  Ec2InstanceId:
+    Value: !Ref ExitNode
+  UserPoolId:
+    Value: !Ref UserPool
+  AppClientId:
+    Value: !Ref UserPoolClient
+  CognitoIssuer:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+  CognitoDomain:
+    Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+  ApiBaseUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint

@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+config.json
+.DS_Store
+.tools/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+terraform/control.zip
+
+terraform/costs.zip
+
+# Local account data and signing material
+.aws/
+*.pem
+*.key
+*.p12
+*.mobileprovision
